@@ -1,16 +1,29 @@
 ---
-version: "3"
+version: "3.9"
 services:
  devopsdb:
    container_name: devopsdb
-   image: dbimage
+   image: shobha722/automation:db 
    ports:
      - "3306:3306"
+   deploy:
+      replicas: 3
+   networks:
+      - mynetwork
 
  application:
    container_name: appcontainer
-   image: appimage
+   image: shobha722/automation:app
    ports:
      - "1234:8080"
+   deploy:
+      replicas: 3
+   networks:
+      - mynetwork
+    
    depends_on:
      - "devopsdb"
+ networks:
+   mynetwork:
+      driver: overlay
+   
