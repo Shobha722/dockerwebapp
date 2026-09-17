@@ -1,0 +1,245 @@
+trigger:
+- master
+
+resources:
+- repo: self
+
+variables:
+  tag: '$(Build.BuildId)'
+
+stages:
+
+# ============================================================
+# STAGE 1: BUILD, PUSH AND DEPLOY
+# ============================================================
+
+- stage: Build
+  displayName: Build, Push and Deploy
+
+  jobs:
+  - job: Build
+    displayName: Maven + Docker Build + Push + Deploy
+
+    pool:
+      vmImage: ubuntu-latest
+
+    steps:
+
+    # --------------------------------------------------------
+    # 1. Checkout Repository
+    # --------------------------------------------------------
+
+    - checkout: self
+      persistCredentials: true
+      clean: true
+
+
+    # --------------------------------------------------------
+    # 2. Maven Build
+    # --------------------------------------------------------
+
+    - task: Maven@4
+      displayName: Build Application using Maven
+      inputs:
+        mavenPomFile: 'pom.xml'
+        publishJUnitResults: true
+        testResultsFiles: '**/surefire-reports/TEST-*.xml'
+        javaHomeOption: 'JDKVersion'
+        mavenVersionOption: 'Default'
+        mavenAuthenticateFeed: false
+        effectivePomSkip: false
+        sonarQubeRunAnalysis: false
+        goals: 'clean package'
+
+
+    # --------------------------------------------------------
+    # 3. Verify Maven Target
+    # --------------------------------------------------------
+
+    - script: |
+        echo "Checking Maven target directory..."
+        ls -lah target
+      displayName: Verify Maven Target
+
+
+    # --------------------------------------------------------
+    # 4. Copy WAR to Docker-app
+    # --------------------------------------------------------
+
+    - task: CopyFiles@2
+      displayName: Copy WAR to Docker-app
+      inputs:
+        SourceFolder: 'target'
+        Contents: '*.war'
+        TargetFolder: 'Docker-app'
+
+
+    # --------------------------------------------------------
+    # 5. Verify Docker-app
+    # --------------------------------------------------------
+
+    - script: |
+        echo "Contents of Docker-app:"
+        ls -lah Docker-app
+      displayName: Verify Docker App Context
+
+
+    # --------------------------------------------------------
+    # 6. Build Web/Application Docker Image
+    # --------------------------------------------------------
+
+    - task: Docker@2
+      displayName: Build Web Application Image
+      inputs:
+        containerRegistry: 'mysvc'
+        repository: 'webrepo'
+        command: 'build'
+        Dockerfile: 'Docker-app/Dockerfile'
+        buildContext: 'Docker-app'
+        tags: |
+          $(Build.BuildId)
+          latest
+
+
+    # --------------------------------------------------------
+    # 7. Verify Docker-db
+    # --------------------------------------------------------
+
+    - script: |
+        echo "Contents of Docker-db:"
+        ls -lah Docker-db
+      displayName: Verify Database Docker Context
+
+
+    # --------------------------------------------------------
+    # 8. Build Database Docker Image
+    # --------------------------------------------------------
+
+    - task: Docker@2
+      displayName: Build Database Image
+      inputs:
+        containerRegistry: 'mysvc'
+        repository: 'dbrepo'
+        command: 'build'
+        Dockerfile: 'Docker-db/Dockerfile'
+        buildContext: 'Docker-db'
+        tags: |
+          $(Build.BuildId)
+          latest
+
+
+    # --------------------------------------------------------
+    # 9. Push Web/Application Image
+    # --------------------------------------------------------
+
+    - task: Docker@2
+      displayName: Push Web Application Image
+      inputs:
+        containerRegistry: 'mysvc'
+        repository: 'webrepo'
+        command: 'push'
+        tags: |
+          $(Build.BuildId)
+          latest
+
+
+    # --------------------------------------------------------
+    # 10. Push Database Image
+    # --------------------------------------------------------
+
+    - task: Docker@2
+      displayName: Push Database Image
+      inputs:
+        containerRegistry: 'mysvc'
+        repository: 'dbrepo'
+        command: 'push'
+        tags: |
+          $(Build.BuildId)
+          latest
+
+
+    # --------------------------------------------------------
+    # 11. Update Kubernetes Manifests
+    # --------------------------------------------------------
+
+    - task: Bash@3
+      displayName: Update Kubernetes Manifests
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -e
+
+          APP_FILE="manifests/app-deployment.yml"
+          DB_FILE="manifests/db-deployment.yml"
+
+          echo "Updating application image..."
+
+          sed -i 's|image:.*webrepo.*|image: projectcontanerreg.azurecr.io/webrepo:latest|g' "$APP_FILE"
+
+          echo "Updating database image..."
+
+          sed -i 's|image:.*dbrepo.*|image: projectcontanerreg.azurecr.io/dbrepo:latest|g' "$DB_FILE"
+
+          echo ""
+          echo "===== Updated app-deployment.yml ====="
+          cat "$APP_FILE"
+
+          echo ""
+          echo "===== Updated db-deployment.yml ====="
+          cat "$DB_FILE"
+
+
+    # --------------------------------------------------------
+    # 12. Commit and Push Manifests to Master
+    # --------------------------------------------------------
+
+    - task: Bash@3
+      displayName: Commit and Push Manifests
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -e
+
+          echo "Git status:"
+          git status
+
+          git config user.email "azure-pipeline@dev.azure.com"
+          git config user.name "Azure DevOps Pipeline"
+
+          git add manifests/app-deployment.yml
+          git add manifests/db-deployment.yml
+
+          if git diff --cached --quiet; then
+            echo "No manifest changes detected."
+            exit 0
+          fi
+
+          git commit -m "Update Kubernetes images - Build $(Build.BuildId)"
+
+          git push origin HEAD:master
+
+
+    # --------------------------------------------------------
+    # 13. Deploy Manifests to AKS
+    # --------------------------------------------------------
+
+
+    - task: Kubernetes@1
+      displayName: Deploy Application to AKS
+      inputs:
+        connectionType: 'Kubernetes Service Connection'
+        kubernetesServiceEndpoint: 'k8ssvc'
+        namespace: 'default'
+        command: 'apply'
+        useConfigurationFile: true
+        configuration: 'manifests/app-deployment.yml'
+
+    - task: Kubernetes@1
+      displayName: Deploy Database to AKS
+      inputs:
+       connectionType: 'Kubernetes Service Connection'
+       kubernetesServiceEndpoint: 'k8ssvc'
+       namespace: 'default'
+       command: 'apply'
+       useConfigurationFile: true
+       configuration: 'manifests/db-deployment.yml'
